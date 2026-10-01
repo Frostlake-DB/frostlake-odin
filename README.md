@@ -8,8 +8,7 @@ package would not keep 38-digit integers exact.
 
 ## Engine version
 
-Requires a Frostlake engine **0.0.7 or newer** (verified against 0.0.7 and the
-0.1.0 release). Ask a running server which one it is with `SELECT CURRENT_VERSION()`.
+Requires a Frostlake engine **0.2.0 or newer**. Ask a running server which one it is with `SELECT CURRENT_VERSION()`.
 The driver versions independently of the engine: it speaks the HTTP protocol, not the
 jar, so this is a floor rather than a lockstep pin.
 
@@ -62,7 +61,11 @@ declared `length`: characters for `VARCHAR`, bytes for `BINARY`, and `16777216` 
 unbounded one, the most it could hold. Every other type has no width, so `length` is
 `nil` there rather than `0`, as it is for a server that predates the field. A failed
 statement returns a non-nil `Error` carrying the engine's message.
-`begin`/`commit`/`rollback` drive transactions.
+`begin`/`commit`/`rollback` drive transactions. `BEGIN` goes out with autocommit off,
+but the connection turns autocommit off only once `BEGIN` has run: a `begin` that
+fails — the transport broke, the DSN's `USE` was refused — leaves the connection
+autocommitting, so what follows is never left in an implicit transaction nobody will
+commit.
 
 DML keeps the result Snowflake gives it: one row holding a `number of rows …` column per
 action — `number of rows inserted` for an INSERT, one per action for a MERGE, and for an
@@ -103,6 +106,35 @@ case. The DSN follows URL conventions: `%XX` escapes decode (with `+` as space i
 query), IPv6 literals are bracketed (`frostlake://[::1]:18082/db`), and `http://`
 without a port means port 80 while `frostlake://` means 18082.
 
+## Session lifetime
+
+The engine keeps a connection's session until it is closed, or until it idles past the
+engine's expiry (30 minutes), is released, or the server restarts. What the driver does
+about that:
+
+- **What is sent.** Every request after the first names the connection's session. Once
+  the engine's first answer carries `newSession` — engines from 0.1.0 on do — each of
+  those requests also carries `requireSession: true`, so an engine that no longer holds
+  the session refuses the request with HTTP 404 and runs nothing, rather than running
+  it in a fresh session at the server's default scope. An engine without `newSession`
+  is never sent the field (`conn.session_support` says which kind answered).
+- **After a lost session.** When the lost session held nothing a fresh one lacks, the
+  driver puts the DSN's scope (its `USE DATABASE` / `USE SCHEMA`) onto a fresh session
+  and sends the statement once more; a second refusal fails. When it held an open
+  transaction (`begin`, or a `BEGIN` / `START TRANSACTION` statement, until its `COMMIT`
+  or `ROLLBACK`), or context set up on it — a `USE`, `SET`/`UNSET`, `ALTER SESSION`, a
+  temporary object, a `CREATE`/`DROP` of a database or schema — re-running the
+  statement would put it somewhere its author did not intend, so `execute` returns an
+  error whose `error_kind(err)` is `.Session_Lost` instead, and the statement did not
+  run. Either way the connection stays usable, and its next statement starts a fresh
+  session on the DSN's scope.
+- **What close does.** `close(&conn)` gives the session back with
+  `DELETE /api/sessions/{id}`, which also rolls back a transaction left open on it, and
+  `destroy_connection` closes a connection that is still open. That is best effort: it
+  waits at most five seconds for the answer, has no error to return, and a second
+  `close` sends nothing. An engine without `newSession` has no such endpoint and is sent
+  nothing; its session lingers until the engine's idle expiry, as it always did.
+
 ## Memory
 
 Everything a call returns is allocated on the allocator you pass it
@@ -110,7 +142,8 @@ Everything a call returns is allocated on the allocator you pass it
 
 - `destroy_result(&result)` frees a `Query_Result` (cells included),
 - `destroy_error(err)` frees an error's message,
-- `destroy_connection(&conn)` frees the connection's internals,
+- `destroy_connection(&conn)` frees the connection's internals, closing it first if it is
+  still open (see *Session lifetime*),
 - `destroy_value(value)` frees a `Value` tree you built from allocated parts.
 
 `get` borrows a cell out of its result — read it, don't destroy it. The test suite runs
@@ -154,8 +187,8 @@ Snowflake's text rendering).
 odin test frostlake -out:frostlake_tests
 ```
 
-The unit half (JSON, DSN, binds, HTTP against a canned loopback server, protocol flows)
-always runs. The integration test boots a real server from the engine's compiled
+The unit half (JSON, DSN, binds, HTTP against a canned loopback server, protocol flows,
+the session lifetime against a scripted engine) always runs. The integration test boots a real server from the engine's compiled
 classes and drives the whole surface over it; it skips itself unless the classpath is
 set:
 
@@ -166,14 +199,28 @@ odin test frostlake -out:frostlake_tests
 
 `JAVA_HOME` is honored when set (plain `java` otherwise; Java 17+).
 
+With `FL_CORPUS` naming the engine's language-neutral test corpus, the same command also
+replays it (its `suites/*.json`) through the driver, against the engine the classpath
+boots (or a running one named by `FROSTLAKE_URL`):
+
+```sh
+export FL_CORPUS=/path/to/frostlake/engine/src/test/resources/testkit
+odin test frostlake -out:frostlake_tests
+```
+
+Without `FL_CORPUS` that test only logs that it skipped the corpus, as `core:testing` has
+no skipped state; a directory with no suites fails it. Give an absolute path — a relative
+one resolves against the test binary's working directory.
+
 ## Protocol
 
 One `POST /api/execute` per statement with `{ sql, sessionId, autoCommit }`, plus
-`multiStatementCount` when a call asks for one; the server issues the `sessionId` on
-first contact and the driver echoes it back, so session state (current
-database/schema, transactions) persists across statements. Failed statements
+`requireSession` once the engine is known to honour it and `multiStatementCount` when a
+call asks for one; the server issues the `sessionId` on first contact and the driver
+echoes it back, so session state (current database/schema, transactions) persists
+across statements. Failed statements
 answer with a non-2xx status and the error JSON in the body, which the driver reads
 regardless of status. A result set's `updateCount`, when the server sends one, is what
 marks it as DML (`-1` for anything else). `GET /api/health` backs `connect`'s
-reachability check. Each
+reachability check, and `DELETE /api/sessions/{id}` releases the session on close. Each
 round trip uses a fresh TCP connection (`Connection: close`).

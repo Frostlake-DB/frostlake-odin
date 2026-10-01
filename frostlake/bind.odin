@@ -135,7 +135,7 @@ encode_sql_string :: proc(text: string, allocator: mem.Allocator) -> string {
 	return strings.to_string(builder)
 }
 
-@(private = "file")
+@(private)
 skip_sql_string :: proc(sql: string, start: int) -> int {
 	j := start + 1
 	for j < len(sql) {
@@ -154,7 +154,7 @@ skip_sql_string :: proc(sql: string, start: int) -> int {
 	return min(j, len(sql))
 }
 
-@(private = "file")
+@(private)
 skip_quoted_ident :: proc(sql: string, start: int) -> int {
 	j := start + 1
 	for j < len(sql) {
@@ -170,7 +170,7 @@ skip_quoted_ident :: proc(sql: string, start: int) -> int {
 	return j
 }
 
-@(private = "file")
+@(private)
 skip_line :: proc(sql: string, start: int) -> int {
 	for j in start ..< len(sql) {
 		if sql[j] == '\n' {
@@ -180,7 +180,7 @@ skip_line :: proc(sql: string, start: int) -> int {
 	return len(sql)
 }
 
-@(private = "file")
+@(private)
 skip_block_comment :: proc(sql: string, start: int) -> int {
 	j := start
 	for j + 1 < len(sql) {
@@ -193,7 +193,7 @@ skip_block_comment :: proc(sql: string, start: int) -> int {
 }
 
 // Non-greedy to the next $$, like the grammar's DOLLAR_QUOTED_STRING: '$$' .*? '$$'.
-@(private = "file")
+@(private)
 skip_dollar_quoted :: proc(sql: string, start: int) -> int {
 	j := start
 	for j + 1 < len(sql) {

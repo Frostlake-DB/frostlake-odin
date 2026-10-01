@@ -17,6 +17,8 @@ Http_Response :: struct {
 	body:   string, // owned by the allocator given to http_request
 }
 
+// timeout bounds each wait for the server's answer, and each write (at most 30
+// seconds); closing's release request passes a shorter one.
 @(private)
 http_request :: proc(
 	host: string,
@@ -25,6 +27,7 @@ http_request :: proc(
 	path: string,
 	json_body: Maybe(string),
 	allocator: mem.Allocator,
+	timeout: time.Duration = 300 * time.Second,
 ) -> (
 	response: Http_Response,
 	err: Error,
@@ -34,8 +37,8 @@ http_request :: proc(
 		return {}, make_errorf(.Http, allocator, "request failed: %v", dial_err)
 	}
 	defer net.close(socket)
-	_ = net.set_option(socket, .Receive_Timeout, time.Duration(300 * time.Second))
-	_ = net.set_option(socket, .Send_Timeout, time.Duration(30 * time.Second))
+	_ = net.set_option(socket, .Receive_Timeout, timeout)
+	_ = net.set_option(socket, .Send_Timeout, min(timeout, 30 * time.Second))
 
 	head := strings.builder_make(allocator)
 	defer strings.builder_destroy(&head)

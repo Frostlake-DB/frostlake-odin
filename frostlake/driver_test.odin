@@ -41,6 +41,148 @@ test_round_trips_learn_and_echo_the_session_id :: proc(t: ^testing.T) {
 	testing.expectf(t, strings.contains(seen[4], "\"autoCommit\":true"), "request was: %s", seen[4])
 }
 
+// Answers for the begin tests, from an engine that reports newSession.
+@(private = "file")
+BEGIN_S1_NEW :: `{"success":true,"sessionId":"s1","newSession":true,"resultSets":[]}`
+@(private = "file")
+BEGIN_S1 :: `{"success":true,"sessionId":"s1","newSession":false,"resultSets":[]}`
+@(private = "file")
+BEGIN_S2_NEW :: `{"success":true,"sessionId":"s2","newSession":true,"resultSets":[]}`
+@(private = "file")
+BEGIN_S2 :: `{"success":true,"sessionId":"s2","newSession":false,"resultSets":[]}`
+
+@(test)
+test_a_failed_begin_leaves_the_connection_autocommitting :: proc(t: ^testing.T) {
+	// BEGIN goes out with autoCommit off, but only a BEGIN that ran turns the
+	// connection's autocommit off: after one that failed, the next statement
+	// still autocommits instead of running in an implicit transaction that
+	// nobody opened and that closing would roll back unseen.
+	failures := []Canned_Exchange{
+		{200, `{"success":false,"errorMessage":"BEGIN refused","sessionId":"s1","newSession":false,"resultSets":[]}`},
+		{502, "<html>Bad Gateway</html>"},
+		{LOOPBACK_HANG_UP, ""},
+	}
+	for failure, index in failures {
+		exchanges := []Canned_Exchange{{200, BEGIN_S1_NEW}, failure, {200, BEGIN_S1}}
+		server := loopback_start(exchanges)
+		dsn := fmt.aprintf("frostlake://127.0.0.1:%d", server.port)
+		conn, open_err := open(dsn)
+		delete(dsn)
+		testing.expect(t, open_err == nil)
+
+		exec_discard(t, &conn, "SELECT 1")
+		begin_err := begin(&conn)
+		if testing.expectf(t, begin_err != nil, "case %d: begin should have failed", index) {
+			destroy_error(begin_err)
+		}
+		testing.expectf(t, conn.auto_commit, "case %d: autocommit stayed off after a failed begin", index)
+		testing.expectf(t, !conn.in_transaction, "case %d: no transaction was opened", index)
+		exec_discard(t, &conn, "INSERT INTO t VALUES (1)")
+
+		seen := loopback_stop(server)
+		if testing.expectf(t, len(seen) == 3, "case %d: %d requests", index, len(seen)) {
+			testing.expectf(
+				t,
+				strings.contains(seen[1], "BEGIN") && strings.contains(seen[1], "\"autoCommit\":false"),
+				"case %d: BEGIN still goes out with autocommit off: %s",
+				index,
+				seen[1],
+			)
+			testing.expectf(
+				t,
+				strings.contains(seen[2], "INSERT") && strings.contains(seen[2], "\"autoCommit\":true"),
+				"case %d: the statement after a failed begin autocommits: %s",
+				index,
+				seen[2],
+			)
+		}
+		destroy_connection(&conn)
+		loopback_destroy(server)
+	}
+}
+
+@(test)
+test_a_begin_behind_a_refused_use_leaves_the_connection_autocommitting :: proc(t: ^testing.T) {
+	// The DSN's USE is owed before the BEGIN; refused, it fails the begin
+	// before any BEGIN is sent, and stays queued for the next statement.
+	refused_use := `{"success":false,"errorMessage":"Database 'APP' does not exist or not authorized.","sessionId":"s1","newSession":true,"resultSets":[]}`
+	exchanges := []Canned_Exchange{{200, refused_use}, {200, BEGIN_S1}, {200, BEGIN_S1}}
+	server := loopback_start(exchanges)
+	defer loopback_destroy(server)
+	dsn := fmt.aprintf("frostlake://127.0.0.1:%d/APP", server.port)
+	defer delete(dsn)
+	conn, open_err := open(dsn)
+	testing.expect(t, open_err == nil)
+	defer destroy_connection(&conn)
+
+	begin_err := begin(&conn)
+	if testing.expect(t, begin_err != nil, "a refused USE should fail the begin") {
+		testing.expectf(t, strings.contains(error_message(begin_err), "APP"), "error was: %s", error_message(begin_err))
+		destroy_error(begin_err)
+	}
+	testing.expect(t, conn.auto_commit, "autocommit stayed off after a failed begin")
+	exec_discard(t, &conn, "INSERT INTO t VALUES (1)")
+
+	seen := loopback_stop(server)
+	if !testing.expect_value(t, len(seen), 3) {
+		return
+	}
+	for request, index in seen {
+		testing.expectf(t, !strings.contains(request, "BEGIN"), "request %d sent a BEGIN: %s", index, request)
+		testing.expectf(t, strings.contains(request, "\"autoCommit\":true"), "request %d did not autocommit: %s", index, request)
+	}
+	testing.expectf(t, strings.contains(seen[1], "USE DATABASE APP"), "the USE stayed queued: %s", seen[1])
+	testing.expectf(t, strings.contains(seen[2], "INSERT"), "then the statement: %s", seen[2])
+}
+
+@(test)
+test_a_begin_its_fresh_session_refuses_leaves_the_connection_autocommitting :: proc(t: ^testing.T) {
+	// The session was gone under the BEGIN, so the scope went onto a fresh
+	// session and the BEGIN once more, still with autocommit off -- and that
+	// one was refused.
+	gone := `{"success":false,"errorMessage":"Session 's1' does not exist or has expired.","sessionId":null,"newSession":false,"resultSets":[]}`
+	refused := `{"success":false,"errorMessage":"BEGIN refused","sessionId":"s2","newSession":false,"resultSets":[]}`
+	exchanges := []Canned_Exchange{
+		{200, BEGIN_S1_NEW}, // USE DATABASE
+		{404, gone},         // BEGIN: the session is gone
+		{200, BEGIN_S2_NEW}, // USE DATABASE, in a fresh session
+		{200, refused},      // BEGIN, once more: refused
+		{200, BEGIN_S2},     // INSERT
+	}
+	server := loopback_start(exchanges)
+	defer loopback_destroy(server)
+	dsn := fmt.aprintf("frostlake://127.0.0.1:%d/APP", server.port)
+	defer delete(dsn)
+	conn, open_err := open(dsn)
+	testing.expect(t, open_err == nil)
+	defer destroy_connection(&conn)
+
+	begin_err := begin(&conn)
+	if testing.expect(t, begin_err != nil, "a refused BEGIN should fail the begin") {
+		destroy_error(begin_err)
+	}
+	testing.expect(t, conn.auto_commit, "autocommit stayed off after a failed begin")
+	testing.expect(t, !conn.in_transaction, "no transaction was opened")
+	exec_discard(t, &conn, "INSERT INTO t VALUES (1)")
+
+	seen := loopback_stop(server)
+	if !testing.expect_value(t, len(seen), 5) {
+		return
+	}
+	testing.expectf(
+		t,
+		strings.contains(seen[3], "BEGIN") && strings.contains(seen[3], "\"autoCommit\":false"),
+		"the BEGIN went again with autocommit off: %s",
+		seen[3],
+	)
+	testing.expectf(
+		t,
+		strings.contains(seen[4], "INSERT") && strings.contains(seen[4], "\"autoCommit\":true"),
+		"the statement after the failed begin autocommits: %s",
+		seen[4],
+	)
+}
+
 @(test)
 test_a_request_declares_a_statement_count_only_when_one_is_asked_for :: proc(t: ^testing.T) {
 	ok := "{\"success\":true,\"sessionId\":\"s-1\",\"resultSets\":[]}"

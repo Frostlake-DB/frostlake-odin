@@ -68,6 +68,18 @@ Error_Kind :: enum {
 	Sql,      // the engine answered success=false
 	Usage,    // driver misuse: bad binds, closed connection, unsupported bind type
 	Json,     // malformed JSON document
+	// The engine no longer holds the connection's session, and what it held -- an
+	// open transaction, a USE, a variable -- went with it. The statement did not
+	// run; the next one starts a fresh session on the DSN's scope.
+	Session_Lost,
+}
+
+// The kind of an error; meaningless for nil.
+error_kind :: proc(err: Error) -> Error_Kind {
+	if detail, ok := err.(Error_Detail); ok {
+		return detail.kind
+	}
+	return {}
 }
 
 Error_Detail :: struct {

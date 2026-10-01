@@ -437,6 +437,140 @@ test_integration_full_driver_flow :: proc(t: ^testing.T) {
 	} else {
 		destroy_result(&failed_result)
 	}
+
+	check_session_lifetime(t, port)
+}
+
+// A session the engine no longer holds, and a session given back on close.
+// Engines before 0.1.0 answer no newSession, never refuse a session and have
+// no DELETE /api/sessions; this driver supports them, so against one of those
+// the checks are skipped rather than passed.
+@(private = "file")
+check_session_lifetime :: proc(t: ^testing.T, port: int) {
+	if !engine_keeps_sessions(t, port) {
+		skip_check("a session the engine no longer holds is recovered from", "this engine answers no newSession")
+		return
+	}
+	scoped_dsn := fmt.aprintf("frostlake://127.0.0.1:%d/odin_test_db?schema=public", port)
+	defer delete(scoped_dsn)
+	conn, connect_err := connect(scoped_dsn)
+	if !testing.expectf(t, connect_err == nil, "connect failed: %s", error_message(connect_err)) {
+		destroy_error(connect_err)
+		return
+	}
+	defer destroy_connection(&conn)
+	if !exec_ok(t, &conn, "SELECT 1") {
+		return
+	}
+	testing.expect_value(t, conn.session_support, Session_Support.Tracked)
+
+	// Released behind the connection's back, as the engine's idle expiry or a
+	// restart would: the next statement runs in a fresh session on the DSN's
+	// scope.
+	before := strings.clone(conn.session_id)
+	defer delete(before)
+	release_session(t, port, before)
+	scope, scope_ok := exec(t, &conn, "SELECT CURRENT_DATABASE() AS d, CURRENT_SCHEMA() AS s")
+	if scope_ok {
+		expect_cell(t, scope, 0, "D", "ODIN_TEST_DB")
+		expect_cell(t, scope, 0, "S", "PUBLIC")
+		destroy_result(&scope)
+	}
+	testing.expectf(t, len(conn.session_id) > 0 && conn.session_id != before, "session %s, was %s", conn.session_id, before)
+
+	// The same with a transaction open is refused: the transaction went with
+	// the session, and the statement did not run.
+	exec_ok(t, &conn, "CREATE OR REPLACE TABLE lost_tx (n INTEGER)")
+	exec_ok(t, &conn, "BEGIN")
+	exec_ok(t, &conn, "INSERT INTO lost_tx VALUES (1)")
+	release_session(t, port, conn.session_id)
+	lost_result, lost_err := execute(&conn, "INSERT INTO lost_tx VALUES (2)")
+	if testing.expect(t, lost_err != nil, "a statement in a lost transaction should fail") {
+		testing.expectf(t, error_kind(lost_err) == .Session_Lost, "failed as %v: %s", error_kind(lost_err), error_message(lost_err))
+		testing.expectf(t, strings.contains(error_message(lost_err), "transaction"), "error was: %s", error_message(lost_err))
+		destroy_error(lost_err)
+	} else {
+		destroy_result(&lost_result)
+	}
+	testing.expect(t, !conn.in_transaction)
+	// Releasing rolled the first INSERT back, the second never ran, and the
+	// connection carries on in a fresh session on its DSN's scope.
+	rows, rows_ok := exec(t, &conn, "SELECT COUNT(*) AS n, CURRENT_DATABASE() AS d FROM lost_tx")
+	if rows_ok {
+		expect_cell(t, rows, 0, "N", i128(0))
+		expect_cell(t, rows, 0, "D", "ODIN_TEST_DB")
+		destroy_result(&rows)
+	}
+
+	// Closing gives the session back: the engine counts one fewer.
+	bare_dsn := fmt.aprintf("frostlake://127.0.0.1:%d", port)
+	defer delete(bare_dsn)
+	closing, closing_err := connect(bare_dsn)
+	if !testing.expectf(t, closing_err == nil, "connect failed: %s", error_message(closing_err)) {
+		destroy_error(closing_err)
+		return
+	}
+	defer destroy_connection(&closing)
+	exec_ok(t, &closing, "SELECT 1")
+	held := active_sessions(t, port)
+	close(&closing)
+	testing.expect_value(t, active_sessions(t, port), held - 1)
+}
+
+// Whether the engine keeps sessions to their id -- it answers newSession, and so
+// honours requireSession and DELETE /api/sessions/{id} -- asked past the driver.
+@(private = "file")
+engine_keeps_sessions :: proc(t: ^testing.T, port: int) -> bool {
+	response, err := http_request("127.0.0.1", port, "POST", "/api/execute", `{"sql":"SELECT 1"}`, context.allocator)
+	if err != nil {
+		destroy_error(err)
+		return false
+	}
+	defer delete(response.body)
+	parsed, parse_err := parse_json(response.body)
+	if parse_err != nil {
+		destroy_error(parse_err)
+		return false
+	}
+	defer destroy_value(parsed)
+	_, keeps := json_get(parsed, "newSession").(bool)
+	if id, has_id := json_get(parsed, "sessionId").(string); has_id && keeps {
+		release_session(t, port, id)
+	}
+	return keeps
+}
+
+// DELETE /api/sessions/{id}, sent past the driver.
+@(private = "file")
+release_session :: proc(t: ^testing.T, port: int, id: string, loc := #caller_location) {
+	path := fmt.aprintf("/api/sessions/%s", id)
+	defer delete(path)
+	response, err := http_request("127.0.0.1", port, "DELETE", path, nil, context.allocator)
+	if !testing.expectf(t, err == nil, "DELETE %s failed: %s", path, error_message(err), loc = loc) {
+		destroy_error(err)
+		return
+	}
+	testing.expectf(t, response.status == 200, "DELETE %s answered HTTP %d: %s", path, response.status, response.body, loc = loc)
+	delete(response.body)
+}
+
+// GET /api/sessions: how many sessions the engine holds.
+@(private = "file")
+active_sessions :: proc(t: ^testing.T, port: int, loc := #caller_location) -> i128 {
+	response, err := http_request("127.0.0.1", port, "GET", "/api/sessions", nil, context.allocator)
+	if !testing.expectf(t, err == nil, "GET /api/sessions failed: %s", error_message(err), loc = loc) {
+		destroy_error(err)
+		return -1
+	}
+	defer delete(response.body)
+	parsed, parse_err := parse_json(response.body)
+	if !testing.expectf(t, parse_err == nil, "GET /api/sessions answered %s", response.body, loc = loc) {
+		destroy_error(parse_err)
+		return -1
+	}
+	defer destroy_value(parsed)
+	count, _ := json_get(parsed, "activeSessions").(i128)
+	return count
 }
 
 // Whether a CURRENT_VERSION() answer such as "0.1.0" or "0.1.1-SNAPSHOT" is at
