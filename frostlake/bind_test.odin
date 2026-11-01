@@ -31,6 +31,39 @@ test_substitution_skips_dollar_quoted_strings :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_substitution_reads_a_name_whole_so_its_dollars_open_no_body :: proc(t: ^testing.T) {
+	expect_substituted(t, "SELECT 1 AS a$$b, ?", {i128(7)}, "SELECT 1 AS a$$b, 7")
+	expect_substituted(t, "SELECT a$$b, $$c?d$$, ?", {i128(7)}, "SELECT a$$b, $$c?d$$, 7")
+}
+
+@(test)
+test_substitution_ends_a_line_comment_at_a_carriage_return :: proc(t: ^testing.T) {
+	expect_substituted(t, "SELECT 1 -- c\r, ?", {i128(7)}, "SELECT 1 -- c\r, 7")
+	expect_substituted(t, "SELECT 1 // c\r, ?", {i128(7)}, "SELECT 1 // c\r, 7")
+	expect_substituted(t, "SELECT 1 -- c?\r\n, ?", {i128(7)}, "SELECT 1 -- c?\r\n, 7")
+}
+
+@(test)
+test_negative_numbers_are_parenthesised :: proc(t: ^testing.T) {
+	expect_substituted(t, "SELECT 3-?", {i128(-5)}, "SELECT 3-(-5)")
+	expect_substituted(t, "SELECT ?::VARCHAR", {i128(-5)}, "SELECT (-5)::VARCHAR")
+	expect_substituted(t, "SELECT 3-?", {f64(-2.5)}, "SELECT 3-(-2.5)")
+	expect_substituted(t, "SELECT ?::VARCHAR", {f64(-2.5)}, "SELECT (-2.5)::VARCHAR")
+	expect_substituted(
+		t,
+		"SELECT 3-?",
+		{i128(-170141183460469231731687303715884105728)},
+		"SELECT 3-(-170141183460469231731687303715884105728)",
+	)
+	expect_substituted(t, "SELECT 3-?", {i128(5)}, "SELECT 3-5")
+	// Negative zero is not below zero, but it renders with a minus all the same.
+	negative_zero := f64(0)
+	negative_zero = -negative_zero
+	expect_substituted(t, "SELECT 3-?", {negative_zero}, "SELECT 3-(-0)")
+	expect_substituted(t, "SELECT ?::VARCHAR", {negative_zero}, "SELECT (-0)::VARCHAR")
+}
+
+@(test)
 test_substitution_rejects_bind_count_mismatch :: proc(t: ^testing.T) {
 	_, not_enough := substitute("SELECT ?, ?", {i128(1)})
 	testing.expect(t, strings.contains(error_message(not_enough), "not enough bind values"))
@@ -59,7 +92,7 @@ test_typed_literal_formatting :: proc(t: ^testing.T) {
 
 @(test)
 test_typed_literal_formatting_edges :: proc(t: ^testing.T) {
-	expect_literal(t, i128(-7), "-7")
+	expect_literal(t, i128(-7), "(-7)")
 	expect_literal(t, Date{"2026-08-19"}, "'2026-08-19'::DATE")
 	expect_literal(t, Bytes{}, "X''")
 

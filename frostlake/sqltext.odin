@@ -170,6 +170,9 @@ skip_non_code :: proc(sql: string, i: int) -> int {
 		return skip_line(sql, i)
 	case c == '/' && next == '*':
 		return skip_block_comment(sql, i + 2)
+	case is_name_start(c):
+		// A name holds no separator, and the $$ inside one opens no body.
+		return skip_name(sql, i)
 	case c == '$' && next == '$':
 		return skip_dollar_quoted(sql, i + 2)
 	}

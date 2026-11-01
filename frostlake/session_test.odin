@@ -408,6 +408,7 @@ test_session_statements_are_recognised :: proc(t: ^testing.T) {
 			"CREATE OR REPLACE LOCAL TEMPORARY TABLE t (a INT)",
 			"CREATE VOLATILE TABLE t (a INT)",
 			"/* note */ -- more\n USE WAREHOUSE w",
+			"-- a line comment ends at a carriage return\rUSE SCHEMA other",
 		}) {
 		testing.expectf(t, touches_session(statement), "%s should touch the session", statement)
 	}
@@ -456,6 +457,14 @@ test_every_statement_of_a_request_is_tracked :: proc(t: ^testing.T) {
 	testing.expect(t, !packed.in_transaction)
 	track_statements(&packed, "BEGIN; INSERT INTO t VALUES (1)")
 	testing.expect(t, packed.in_transaction)
+	// A name's dollars open no body, and a line comment ends at a carriage
+	// return too, so the USE behind either is still seen.
+	named: Connection
+	track_statements(&named, "SELECT 1 AS a$$b; USE SCHEMA other")
+	testing.expect(t, named.dirty)
+	commented: Connection
+	track_statements(&commented, "SELECT 1 -- c\r; USE SCHEMA other")
+	testing.expect(t, commented.dirty)
 }
 
 // A connection on the scripted server whose DSN names database APP.

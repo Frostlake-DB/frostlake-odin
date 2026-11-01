@@ -29,6 +29,9 @@ substitute :: proc(sql: string, binds: []Value, allocator := context.allocator) 
 			i = skip_block_comment(sql, i + 2)
 		} else if c == '/' && i + 1 < len(sql) && sql[i + 1] == '/' {
 			i = skip_line(sql, i)
+		} else if is_name_start(c) {
+			// A name is read whole, as the lexer reads one: the $$ in a$$b opens no body.
+			i = skip_name(sql, i)
 		} else if c == '$' && i + 1 < len(sql) && sql[i + 1] == '$' {
 			i = skip_dollar_quoted(sql, i + 2)
 		} else if c == '?' {
@@ -68,12 +71,12 @@ format_literal :: proc(value: Value, allocator := context.allocator) -> (out: st
 	case bool:
 		return strings.clone("TRUE" if v else "FALSE", allocator), nil
 	case i128:
-		return fmt.aprintf("%d", v, allocator = allocator), nil
+		return signed(fmt.aprintf("%d", v, allocator = allocator), allocator), nil
 	case f64:
 		if math.is_nan(v) || math.is_inf(v, 0) {
 			return "", make_errorf(.Usage, allocator, "non-finite number %v", v)
 		}
-		return fmt.aprintf("%v", v, allocator = allocator), nil
+		return signed(fmt.aprintf("%v", v, allocator = allocator), allocator), nil
 	case string:
 		return encode_sql_string(v, allocator), nil
 	case Bytes:
@@ -115,6 +118,20 @@ format_literal :: proc(value: Value, allocator := context.allocator) -> (out: st
 		return "", make_error(.Usage, "unsupported bind type object", allocator)
 	}
 	return strings.clone("NULL", allocator), nil
+}
+
+// Parenthesises a numeral that starts with '-', which is then one value wherever
+// it lands: bare, 3-? bound to -5 would read 3--5, a line comment, and ?::VARCHAR
+// would cast before it negates. The rendered text decides, not a < 0 test, so
+// negative zero (rendered -0) is wrapped too. Takes ownership of numeral.
+@(private = "file")
+signed :: proc(numeral: string, allocator: mem.Allocator) -> string {
+	if !strings.has_prefix(numeral, "-") {
+		return numeral
+	}
+	wrapped := fmt.aprintf("(%s)", numeral, allocator = allocator)
+	delete(numeral, allocator)
+	return wrapped
 }
 
 @(private = "file")
@@ -170,14 +187,37 @@ skip_quoted_ident :: proc(sql: string, start: int) -> int {
 	return j
 }
 
+// A line comment ends at a line feed or a carriage return, whichever comes
+// first, as the lexer's LINE_COMMENT does: ('--' | '//') ~[\r\n]*.
 @(private)
 skip_line :: proc(sql: string, start: int) -> int {
 	for j in start ..< len(sql) {
-		if sql[j] == '\n' {
+		if sql[j] == '\n' || sql[j] == '\r' {
 			return j + 1
 		}
 	}
 	return len(sql)
+}
+
+@(private)
+is_name_start :: proc(c: u8) -> bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+@(private = "file")
+is_name_part :: proc(c: u8) -> bool {
+	return is_name_start(c) || (c >= '0' && c <= '9') || c == '$'
+}
+
+// The end of the name that starts at start, read as the lexer reads an
+// IDENTIFIER: [a-zA-Z_][a-zA-Z0-9_$]*.
+@(private)
+skip_name :: proc(sql: string, start: int) -> int {
+	j := start + 1
+	for j < len(sql) && is_name_part(sql[j]) {
+		j += 1
+	}
+	return j
 }
 
 @(private)

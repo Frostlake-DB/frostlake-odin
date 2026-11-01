@@ -161,7 +161,7 @@ drivers. `Value` is a union; the nil variant is SQL NULL:
 | --- | --- |
 | nil | `NULL` |
 | `bool` | `TRUE` / `FALSE` |
-| `i128` / `f64` | as written |
+| `i128` / `f64` | as written, a negative one in parentheses: `(-5)` |
 | `string` | `'…'` (backslashes and quotes escaped) |
 | `Bytes` | `X'hex'` |
 | `Date{"2026-08-13"}` | `'…'::DATE` |
